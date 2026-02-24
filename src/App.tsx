@@ -83,6 +83,7 @@ export default function App() {
   const [isChatMode, setIsChatMode] = useState(false);
   const [messages, setMessages] = useState<Message[]>([]);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const API_BASE = '/api/v1';
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -94,49 +95,152 @@ export default function App() {
     }
   }, [messages, isChatMode]);
 
-  const handleStartCreation = () => {
+  const callApi = async <T,>(path: string, options?: RequestInit): Promise<T> => {
+    const response = await fetch(`${API_BASE}${path}`, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+    });
+
+    const payload = await response.json();
+    if (!response.ok || payload?.success === false) {
+      const errorMessage = payload?.error?.message || payload?.message || `Request failed: ${response.status}`;
+      throw new Error(errorMessage);
+    }
+
+    return payload.data as T;
+  };
+
+  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+  const pollTask = async (taskId: string) => {
+    for (let i = 0; i < 30; i += 1) {
+      const task = await callApi<any>(`/tasks/${taskId}`);
+      if (task.status === 'completed' || task.status === 'failed') {
+        return task;
+      }
+      await sleep(800);
+    }
+    throw new Error('分镜任务超时，请稍后查看任务状态');
+  };
+
+  const handleStartCreation = async () => {
     if (!inputText.trim()) return;
-    
+
+    const prompt = inputText.trim();
     setIsChatMode(true);
     const userMsg: Message = {
       id: Date.now().toString(),
       type: 'user',
-      content: inputText,
+      content: prompt,
       sender: 'user',
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     };
-    
-    setMessages([userMsg]);
+
+    const progressMsg: Message = {
+      id: (Date.now() + 1).toString(),
+      type: 'tool-call',
+      sender: 'ai',
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      toolSteps: [
+        { label: '创建剧本', detail: '向后端提交创作请求', status: 'loading' },
+        { label: '保存章节', detail: '写入剧本文本', status: 'pending' },
+        { label: '生成分镜', detail: '执行异步分镜任务', status: 'pending' },
+      ]
+    };
+
+    setMessages([userMsg, progressMsg]);
     setInputText('');
 
-    // Simulate AI Response sequence
-    setTimeout(() => {
-      const toolCallMsg: Message = {
-        id: (Date.now() + 1).toString(),
-        type: 'tool-call',
-        sender: 'ai',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        toolSteps: [
-          { label: '更新相关信息', detail: '设置用户意图和视频参数', status: 'completed' },
-          { label: '更新相关信息', detail: '设置视频配置参数', status: 'completed' },
-          { label: '进行剧本生成...', status: 'completed' },
-        ]
-      };
-      setMessages(prev => [...prev, toolCallMsg]);
-    }, 1000);
+    try {
+      const drama = await callApi<any>('/dramas', {
+        method: 'POST',
+        body: JSON.stringify({
+          title: prompt.slice(0, 30),
+          description: prompt,
+          style: 'anime',
+        }),
+      });
 
-    setTimeout(() => {
+      setMessages(prev => prev.map(msg => (
+        msg.id === progressMsg.id
+          ? {
+              ...msg,
+              toolSteps: [
+                { label: '创建剧本', detail: `剧本 ID: ${drama.id}`, status: 'completed' },
+                { label: '保存章节', detail: '写入剧本文本', status: 'loading' },
+                { label: '生成分镜', detail: '执行异步分镜任务', status: 'pending' },
+              ],
+            }
+          : msg
+      )));
+
+      await callApi(`/dramas/${drama.id}/episodes`, {
+        method: 'PUT',
+        body: JSON.stringify({
+          episodes: [
+            {
+              episode_number: 1,
+              title: '第1集',
+              script_content: prompt,
+              status: 'draft',
+            },
+          ],
+        }),
+      });
+
+      const dramaDetail = await callApi<any>(`/dramas/${drama.id}`);
+      const firstEpisode = dramaDetail.episodes?.[0];
+      if (!firstEpisode?.id) {
+        throw new Error('未找到可用章节，无法生成分镜');
+      }
+
+      setMessages(prev => prev.map(msg => (
+        msg.id === progressMsg.id
+          ? {
+              ...msg,
+              toolSteps: [
+                { label: '创建剧本', detail: `剧本 ID: ${drama.id}`, status: 'completed' },
+                { label: '保存章节', detail: `章节 ID: ${firstEpisode.id}`, status: 'completed' },
+                { label: '生成分镜', detail: '执行异步分镜任务', status: 'loading' },
+              ],
+            }
+          : msg
+      )));
+
+      const taskResp = await callApi<{ task_id: string }>(`/episodes/${firstEpisode.id}/storyboards`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      });
+      const task = await pollTask(taskResp.task_id);
+      if (task.status !== 'completed') {
+        throw new Error(task.error || '分镜任务执行失败');
+      }
+
+      const storyboards = await callApi<any[]>(`/episodes/${firstEpisode.id}/storyboards`);
+      const storyboardCount = storyboards.length;
+      const firstAction = storyboards[0]?.action || '已根据你的描述生成分镜内容';
+
+      setMessages(prev => prev.map(msg => (
+        msg.id === progressMsg.id
+          ? {
+              ...msg,
+              toolSteps: [
+                { label: '创建剧本', detail: `剧本 ID: ${drama.id}`, status: 'completed' },
+                { label: '保存章节', detail: `章节 ID: ${firstEpisode.id}`, status: 'completed' },
+                { label: '生成分镜', detail: `任务 ${taskResp.task_id}`, status: 'completed' },
+              ],
+            }
+          : msg
+      )));
+
       const textMsg: Message = {
         id: (Date.now() + 2).toString(),
         type: 'text',
-        content: `剧本创作完成！我为你制作了一个精彩的张三丰大战张无忌的武侠剧本，总时长约24秒，完全符合500字以内的要求。\n\n**剧本概览**\n**故事核心**：元朝末年，武当与明教因正邪之辩，在武当山巅展开巅峰对决。张三丰以太极奥义化解张无忌的九阳神功，最终阐释“阴阳相生相克，何来正邪之分”的哲理。\n\n**分镜设计**：\n- **对峙开场** - 武当山巅金殿前，两位绝世高手对峙\n- **张无忌出招** - 腾空跃起，九阳神功红色能量波\n- **张三丰化解** - 太极剑画圆，白色气流漩涡\n- **剑掌交锋** - 太极剑与能量碰撞，金色火花四溅`,
+        content: `剧本创作完成，后端已生成 ${storyboardCount} 个分镜。\n\n示例分镜：${firstAction}`,
         sender: 'ai',
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       };
-      setMessages(prev => [...prev, textMsg]);
-    }, 2500);
 
-    setTimeout(() => {
       const actionCardMsg: Message = {
         id: (Date.now() + 3).toString(),
         type: 'action-card',
@@ -144,9 +248,9 @@ export default function App() {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         cardData: {
           title: '剧本',
-          description: '视频策划',
-          duration: '24秒',
-          style: '日漫 电影质感',
+          description: `剧本 ID: ${drama.id}`,
+          duration: `${Math.max(8, storyboardCount * 3)}秒`,
+          style: '动漫风',
           icon: <FileText size={18} />,
           actions: [
             { label: '查看剧本' },
@@ -154,53 +258,7 @@ export default function App() {
           ]
         }
       };
-      setMessages(prev => [...prev, actionCardMsg]);
-    }, 3500);
 
-    setTimeout(() => {
-      const configMsg: Message = {
-        id: (Date.now() + 4).toString(),
-        type: 'config-form',
-        sender: 'ai',
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        configData: {
-          title: '张三丰大战张无忌剧本创作确认',
-          sections: [
-            {
-              label: '1. 视频时长要求',
-              options: [
-                { label: '15秒内', value: '15' },
-                { label: '30秒内', value: '30' },
-                { label: '45秒内', value: '45' },
-                { label: '1分钟以上', value: '60' },
-                { label: '系统推荐时长', value: 'auto', selected: true },
-              ]
-            },
-            {
-              label: '2. 视频比例',
-              options: [
-                { label: '16:9横屏', value: '16:9', selected: true },
-                { label: '9:16竖屏', value: '9:16' },
-                { label: '4:3', value: '4:3' },
-                { label: '3:4', value: '3:4' },
-              ]
-            },
-            {
-              label: '3. 视频风格',
-              options: [
-                { label: '写实风', value: 'realistic' },
-                { label: '动漫风', value: 'anime', selected: true },
-                { label: '3D动画', value: '3d' },
-                { label: '像素风', value: 'pixel' },
-              ]
-            }
-          ]
-        }
-      };
-      setMessages(prev => [...prev, configMsg]);
-    }, 4500);
-
-    setTimeout(() => {
       const storyboardMsg: Message = {
         id: (Date.now() + 5).toString(),
         type: 'storyboard-card',
@@ -208,15 +266,15 @@ export default function App() {
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         cardData: {
           title: '视频分镜',
-          description: '角色：张三丰（武当祖师）、张无忌（明教教主）；场景：武当山巅金殿前；物品：太极剑、明教令牌；情节：张三丰与张无忌因门派理念冲突在武当山巅对峙，张无忌以九阳神功与乾坤大挪移发起攻击，张三丰以太极剑化解攻势...',
-          duration: '29秒',
-          style: '日漫 电影质感',
+          description: storyboards.slice(0, 3).map((item, idx) => `${idx + 1}. ${item.action || item.title || '分镜内容'}`).join('；'),
+          duration: `${storyboardCount * 3}秒`,
+          style: '动漫 电影质感',
           icon: <Clapperboard size={18} />,
           stats: [
-            { label: '角色', value: '3 角色', icon: <Users size={14} /> },
-            { label: '场景', value: '1 场景', icon: <MapPin size={14} /> },
-            { label: '时长', value: '8 分镜', icon: <Clock size={14} /> },
-            { label: '道具', value: '2 道具', icon: <Package size={14} /> },
+            { label: '角色', value: `${(dramaDetail.characters || []).length} 角色`, icon: <Users size={14} /> },
+            { label: '场景', value: `${(dramaDetail.scenes || []).length} 场景`, icon: <MapPin size={14} /> },
+            { label: '时长', value: `${storyboardCount} 分镜`, icon: <Clock size={14} /> },
+            { label: '道具', value: `${(dramaDetail.props || []).length} 道具`, icon: <Package size={14} /> },
           ],
           actions: [
             { label: '生成视频' },
@@ -224,8 +282,18 @@ export default function App() {
           ]
         }
       };
-      setMessages(prev => [...prev, storyboardMsg]);
-    }, 6000);
+
+      setMessages(prev => [...prev, textMsg, actionCardMsg, storyboardMsg]);
+    } catch (error) {
+      const errMsg: Message = {
+        id: (Date.now() + 9).toString(),
+        type: 'text',
+        content: `连接后端失败：${error instanceof Error ? error.message : '未知错误'}\n请确认 drama 后端已在 5678 端口启动。`,
+        sender: 'ai',
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+      };
+      setMessages(prev => [...prev, errMsg]);
+    }
   };
 
   return (
